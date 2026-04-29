@@ -7,6 +7,21 @@ Run this after deploying to Railway to verify all endpoints work
 import requests
 import json
 from datetime import datetime
+import os
+
+# If running under pytest in CI, provide a base_url fixture that reads TEST_BASE_URL.
+try:
+    import pytest
+
+    @pytest.fixture
+    def base_url():
+        url = os.environ.get("TEST_BASE_URL")
+        if not url:
+            pytest.skip("TEST_BASE_URL not set; skipping deployment integration test")
+        return url
+except Exception:
+    # Not running under pytest or fixtures not available; continue for CLI usage
+    pass
 
 def test_bot(base_url):
     """Test all 5 required endpoints"""
