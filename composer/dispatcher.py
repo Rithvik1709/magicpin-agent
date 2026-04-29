@@ -36,40 +36,43 @@ class Dispatcher:
         """
         Compose a message for a single trigger.
 
-        Returns an action dict ready for the /v1/tick response, or None.
+        Returns an action dict ready for the /v1/tick response, or None if composition fails.
         """
+        # Step 1: Resolve context
         ctx = self.resolver.resolve(trigger_id)
         if not ctx:
-            logger.warning(f"Could not resolve context for trigger {trigger_id}")
+            logger.warning(f"Failed to resolve context for trigger {trigger_id}")
             return None
 
-        # Dedup by suppression key
+        # Step 2: Check suppression
         sup_key = ctx.trigger.get("suppression_key", "")
         if sup_key and sup_key in self._sent_suppression_keys:
-            logger.info(f"Suppressed duplicate: {sup_key}")
+            logger.debug(f"Suppressed duplicate: {sup_key}")
             return None
 
-        # Build prompt
+        # Step 3: Build prompt and call LLM or fallback
         system_prompt, user_prompt = build_prompt(ctx)
+        composed = None
 
-        # Call LLM
         try:
             raw = await self.llm_fn(system_prompt, user_prompt)
             composed = self._parse_llm_output(raw)
+            logger.debug(f"LLM composed: {ctx.trigger.get('kind')} for {ctx.merchant_id}")
         except Exception as e:
-            logger.error(f"LLM call failed for {trigger_id}: {e}")
+            logger.warning(f"LLM failed for {trigger_id}: {e} — falling back to deterministic")
             composed = self._fallback_compose(ctx)
 
-        # Validate and fix
+        # Step 4: Validate and fix
         is_valid, issues = validate(composed, ctx)
         if issues:
-            logger.info(f"Validation issues for {trigger_id}: {issues}")
+            issue_str = "; ".join(issues[:3])  # Log first 3 issues
+            logger.debug(f"Validation issues for {trigger_id}: {issue_str}")
 
-        # Mark as sent
+        # Step 5: Mark as sent
         if sup_key:
             self._sent_suppression_keys.add(sup_key)
 
-        # Build action response
+        # Step 6: Build action response
         scope = ctx.trigger.get("scope", "merchant")
         return {
             "conversation_id": f"conv_{ctx.merchant_id}_{trigger_id}",
@@ -114,7 +117,7 @@ class Dispatcher:
         category = ctx.category
         
         m_name = merchant.get("identity", {}).get("owner_first_name", "there")
-        biz_name = merchant.get("identity", {}).get("name", "your business")
+        m_full_name = merchant.get("identity", {}).get("name", "your business")
         kind = trigger.get("kind", "update")
         scope = trigger.get("scope", "merchant")
         payload = trigger.get("payload", {})
@@ -138,25 +141,87 @@ class Dispatcher:
             delta = payload.get("delta_pct", "0")
             body = f"Hi {m_name}, noticed your {metric} is down by {delta}% this week. Based on peer data in {category.get('slug')}, this looks like a seasonal shift. Should we skip ad spend this week to save budget?"
             
+        elif kind == "perf_spike":
+            metric = payload.get("metric", "views")
+            delta = payload.get("delta_pct", "0")
+            body = f"Hi {m_name}, Vera here! Your {metric} jumped {delta}% this week. This looks sustainable. Want to capitalize on this momentum with a targeted campaign?"
+            cta = "binary_yes_stop"
+            
         elif kind == "recall_due" and ctx.customer:
             c_name = ctx.customer.get("identity", {}).get("name", "there")
             slots = payload.get("available_slots", ["tomorrow"])
             slot_str = slots[0] if slots else "soon"
-            body = f"Hi {c_name}, {biz_name} here! It's been a few months since your last visit. We have a slot available {slot_str}. Would you like to book a cleaning?"
+            body = f"Hi {c_name}, {m_full_name} here! It's been a few months since your last visit. We have a slot available {slot_str}. Would you like to book?"
             cta = "binary_yes_stop"
+            send_as = "merchant_on_behalf"
             
         elif kind == "ipl_match_today":
             match = payload.get("match", "the IPL match")
             body = f"Hi {m_name}, {match} is tonight. Usually, this leads to a dip in dine-in covers. Want me to push a BOGO delivery offer for tonight instead?"
             
+        elif kind == "renewal_due":
+            days_left = payload.get("days_remaining", "0")
+            plan = merchant.get("subscription", {}).get("plan", "professional")
+            body = f"Hi {m_name}, your {plan} subscription expires in {days_left} days. Want me to walk you through the renewal process? Takes just 2 minutes."
+            cta = "binary_yes_stop"
+            
+        elif kind == "festival_upcoming":
+            festival = payload.get("festival_name", "the upcoming festival")
+            days_until = payload.get("days_until", "30")
+            body = f"Hi {m_name}, {festival} is coming up in {days_until} days. This is a big footfall window for {category.get('slug')}. Want me to draft a seasonal offer for you?"
+            cta = "binary_yes_stop"
+            
+        elif kind == "regulation_change":
+            change = payload.get("summary", "a regulation update")
+            deadline = payload.get("deadline", "soon")
+            body = f"Hi {m_name}, Vera here. There's a compliance update relevant to your business. Deadline: {deadline}. Want me to break it down for you and suggest next steps?"
+            
+        elif kind == "milestone_reached":
+            milestone = payload.get("milestone", "100 reviews")
+            body = f"Hi {m_name}, congrats! You've hit {milestone}! 🎉 Want to celebrate this with a GBP post or customer thank-you campaign?"
+            cta = "binary_yes_stop"
+            
+        elif kind == "competitor_opened":
+            competitor = payload.get("competitor_name", "a new competitor")
+            distance = payload.get("distance_km", "nearby")
+            body = f"Hi {m_name}, {competitor} just opened {distance}. Let's sharpen your differentiation. What's one thing you offer that they don't?"
+            
+        elif kind == "review_theme_emerged":
+            theme = payload.get("theme", "pricing")
+            count = payload.get("count", "5")
+            sentiment = payload.get("sentiment", "mixed")
+            body = f"Hi {m_name}, I noticed customers are mentioning '{theme}' in reviews ({count} times, {sentiment}). Should we address this in a post or FAQ?"
+            
+        elif kind == "customer_lapsed_soft" and ctx.customer:
+            c_name = ctx.customer.get("identity", {}).get("name", "there")
+            body = f"Hi {c_name}, it's been a while! We'd love to see you again. Got a slot next week if you're interested."
+            cta = "binary_yes_stop"
+            send_as = "merchant_on_behalf"
+            
+        elif kind == "customer_lapsed_hard" and ctx.customer:
+            c_name = ctx.customer.get("identity", {}).get("name", "there")
+            body = f"Hi {c_name}, we miss you! Try us again this week — first visit is on us."
+            cta = "binary_yes_stop"
+            send_as = "merchant_on_behalf"
+            
+        elif kind == "gbp_unverified":
+            uplift = payload.get("estimated_uplift_pct", "23")
+            body = f"Hi {m_name}, Vera here. Verified GBP gets ~{uplift}% more interactions. Let me start the verification for you (takes 5 mins). Want me to do that?"
+            cta = "binary_yes_stop"
+            
+        elif kind == "supply_alert":
+            product = payload.get("product", "a product")
+            batch = payload.get("batch_id", "unknown")
+            body = f"Hi {m_name}, ALERT: {product} (batch {batch}) may have an issue. Let me draft a customer notification and replacement flow for you."
+            
         else:
-            # Generic but clean
+            # Generic fallback with context awareness
             if scope == "customer" and ctx.customer:
                 c_name = ctx.customer.get("identity", {}).get("name", "there")
-                body = f"Hi {c_name}, {biz_name} here. We have a personalized update for you. Would you like to hear more?"
+                body = f"Hi {c_name}, {m_full_name} here. We have a personalized update for you. Want to hear more?"
                 cta = "binary_yes_stop"
             else:
-                body = f"Hi {m_name}, Vera here. I have a new insight for {biz_name} regarding {kind.replace('_', ' ')}. Interested in a quick breakdown?"
+                body = f"Hi {m_name}, Vera here. I have a new insight for {m_full_name} regarding {kind.replace('_', ' ')}. Interested in a quick breakdown?"
 
         return {
             "body": body,

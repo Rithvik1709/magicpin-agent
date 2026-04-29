@@ -201,53 +201,84 @@ async def metadata():
 
 @app.post("/v1/context")
 async def push_context(body: ContextBody):
-    accepted, reason, current_version = store.push(
-        body.scope, body.context_id, body.version, body.payload
-    )
+    """Receive and store context push (trigger, merchant, category, customer)."""
+    try:
+        accepted, reason, current_version = store.push(
+            body.scope, body.context_id, body.version, body.payload
+        )
 
-    if not accepted:
-        if reason == "stale_version":
-            return {"accepted": False, "reason": "stale_version", "current_version": current_version}
-        return {"accepted": False, "reason": reason, "details": f"Invalid {reason}"}
+        if not accepted:
+            if reason == "stale_version":
+                logger.debug(f"Stale version for {body.scope}:{body.context_id} (current={current_version}, got={body.version})")
+                return {"accepted": False, "reason": "stale_version", "current_version": current_version}
+            logger.warning(f"Rejected {body.scope}:{body.context_id} — {reason}")
+            return {"accepted": False, "reason": reason, "details": f"Invalid {reason}"}
 
-    return {
-        "accepted": True,
-        "ack_id": f"ack_{body.context_id}_v{body.version}",
-        "stored_at": datetime.now(timezone.utc).isoformat() + "Z",
-    }
+        logger.debug(f"Stored {body.scope}:{body.context_id} v{body.version}")
+        return {
+            "accepted": True,
+            "ack_id": f"ack_{body.context_id}_v{body.version}",
+            "stored_at": datetime.now(timezone.utc).isoformat() + "Z",
+        }
+    except Exception as e:
+        logger.error(f"Error pushing context: {e}", exc_info=True)
+        return {"accepted": False, "reason": "internal_error", "details": str(e)}
 
 
 @app.post("/v1/tick")
 async def tick(body: TickBody):
+    """Process available triggers and compose engagement messages."""
     actions = []
+    errors = []
+
+    if not body.available_triggers:
+        logger.info("Tick: no triggers available")
+        return {"actions": []}
 
     for trigger_id in body.available_triggers:
         try:
             action = await dispatcher.compose_for_trigger(trigger_id)
             if action and action.get("body"):
                 actions.append(action)
+            else:
+                logger.debug(f"No action for trigger {trigger_id}")
         except Exception as e:
-            logger.error(f"Error composing for {trigger_id}: {e}")
+            logger.error(f"Error composing for {trigger_id}: {e}", exc_info=True)
+            errors.append({"trigger_id": trigger_id, "error": str(e)})
             continue
 
-    logger.info(f"Tick: {len(body.available_triggers)} triggers → {len(actions)} actions")
-    return {"actions": actions}
+    logger.info(f"Tick: {len(body.available_triggers)} triggers → {len(actions)} actions, {len(errors)} errors")
+    response = {"actions": actions}
+    if errors and logger.isEnabledFor(logging.DEBUG):
+        response["errors"] = errors
+    return response
 
 
 @app.post("/v1/reply")
 async def reply(body: ReplyBody):
+    """Handle incoming merchant/customer replies."""
     try:
+        if not body.merchant_id:
+            logger.warning(f"Reply without merchant_id: conv={body.conversation_id}")
+            return {
+                "action": "send",
+                "body": "I need to know which business this is about. Can you confirm?",
+                "cta": "open_ended",
+                "rationale": "Missing merchant context",
+            }
+
         result = await reply_handler.handle_reply(
             conversation_id=body.conversation_id,
-            merchant_id=body.merchant_id or "",
+            merchant_id=body.merchant_id,
             customer_id=body.customer_id,
             from_role=body.from_role,
             message=body.message,
             turn_number=body.turn_number,
         )
+        logger.debug(f"Reply handled: {body.from_role} in {body.conversation_id} → {result.get('action')}")
         return result
     except Exception as e:
-        logger.error(f"Reply handler error: {e}")
+        logger.error(f"Reply handler error: {e}", exc_info=True)
         return {
             "action": "send",
             "body": "Got it — let me check on that and get back to you.",

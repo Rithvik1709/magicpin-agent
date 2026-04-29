@@ -8,8 +8,11 @@ Handles idempotent writes and version-gated atomic replace.
 from __future__ import annotations
 
 import threading
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ContextStore:
@@ -32,8 +35,18 @@ class ContextStore:
         Returns:
             (accepted, reason_if_rejected, current_version_if_stale)
         """
+        # Validate inputs
         if scope not in self.VALID_SCOPES:
             return False, "invalid_scope", None
+        
+        if not context_id or not isinstance(context_id, str):
+            return False, "invalid_context_id", None
+        
+        if version < 0 or not isinstance(version, int):
+            return False, "invalid_version", None
+        
+        if not isinstance(payload, dict):
+            return False, "invalid_payload", None
 
         key = (scope, context_id)
 

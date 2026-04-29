@@ -121,18 +121,23 @@ class ReplyHandler:
         return await self._compose_reply(conv, merchant_id, customer_id, message)
 
     def _is_auto_reply(self, msg_lower: str, conv: ConversationState) -> bool:
-        # Pattern match
+        # Pattern match against known auto-reply templates
         for pattern in AUTO_REPLY_PATTERNS:
             if pattern in msg_lower:
+                conv.last_auto_reply_text = msg_lower
                 return True
-        # Same verbatim message repeated
+        
+        # Check if same message repeated verbatim (indicates bot loop)
         if conv.last_auto_reply_text and msg_lower == conv.last_auto_reply_text:
             return True
+        
+        # Check if last two merchant messages are identical (strong auto-reply signal)
         if len(conv.turns) >= 2:
             prev_msgs = [t["message"].lower().strip() for t in conv.turns if t["from"] != "vera"]
             if len(prev_msgs) >= 2 and prev_msgs[-1] == prev_msgs[-2]:
                 conv.last_auto_reply_text = msg_lower
                 return True
+        
         return False
 
     def _is_hostile(self, msg_lower: str) -> bool:
