@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "nixpacks"
+  },
+  "deploy": {
+    "startCommand": "python bot.py",
+    "healthcheckPath": "/v1/healthz"
+  }
+}
