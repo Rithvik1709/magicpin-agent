@@ -53,6 +53,12 @@ class ContextStore:
         with self._lock:
             existing = self._data.get(key)
             if existing and existing["version"] >= version:
+                logger.debug(
+                    "Context push rejected (stale): %s %s existing_version=%s",
+                    scope,
+                    context_id,
+                    existing["version"],
+                )
                 return False, "stale_version", existing["version"]
 
             self._data[key] = {
@@ -60,6 +66,7 @@ class ContextStore:
                 "payload": payload,
                 "stored_at": datetime.now(timezone.utc).isoformat(),
             }
+            logger.debug("Context pushed: %s %s version=%s", scope, context_id, version)
             return True, None, None
 
     # ─── Read helpers ─────────────────────────────────────────────

@@ -15,6 +15,7 @@ from .context_store import ContextStore
 from .resolver import ContextResolver, ResolvedContext
 from .prompts import build_prompt
 from .validator import validate
+from .utils import sanitize_for_logs
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +58,25 @@ class Dispatcher:
         try:
             raw = await self.llm_fn(system_prompt, user_prompt)
             composed = self._parse_llm_output(raw)
-            logger.debug(f"LLM composed: {ctx.trigger.get('kind')} for {ctx.merchant_id}")
+            logger.debug(
+                "LLM composed: %s for %s — output sanitized: %s",
+                ctx.trigger.get("kind"),
+                ctx.merchant_id,
+                sanitize_for_logs(raw)[:200],
+            )
         except Exception as e:
-            logger.warning(f"LLM failed for {trigger_id}: {e} — falling back to deterministic")
+            logger.warning(
+                "LLM failed for %s: %s — falling back to deterministic",
+                trigger_id,
+                str(e),
+            )
             composed = self._fallback_compose(ctx)
 
         # Step 4: Validate and fix
         is_valid, issues = validate(composed, ctx)
         if issues:
             issue_str = "; ".join(issues[:3])  # Log first 3 issues
-            logger.debug(f"Validation issues for {trigger_id}: {issue_str}")
+            logger.debug("Validation issues for %s: %s", trigger_id, issue_str)
 
         # Step 5: Mark as sent
         if sup_key:
@@ -74,7 +84,7 @@ class Dispatcher:
 
         # Step 6: Build action response
         scope = ctx.trigger.get("scope", "merchant")
-        return {
+        action = {
             "conversation_id": f"conv_{ctx.merchant_id}_{trigger_id}",
             "merchant_id": ctx.merchant_id,
             "customer_id": ctx.customer_id,
@@ -91,6 +101,11 @@ class Dispatcher:
             "suppression_key": composed.get("suppression_key", sup_key),
             "rationale": composed.get("rationale", ""),
         }
+
+        # Expose validation issues for transparency (may be empty)
+        action["validation_issues"] = issues or []
+
+        return action
 
     def _parse_llm_output(self, raw: str) -> dict:
         """Extract JSON from LLM response."""
