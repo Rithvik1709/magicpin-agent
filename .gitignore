@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+
+# Challenge Data (if generated)
+dataset/expanded_*.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
