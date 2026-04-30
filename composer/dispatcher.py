@@ -4,9 +4,11 @@ Dispatcher: resolves context, calls LLM, validates output.
 This is the main composition engine.
 """
 
+
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import re
 import logging
 from typing import Optional, Callable, Awaitable
@@ -125,6 +127,36 @@ class Dispatcher:
             "rationale": "Parsed from raw LLM output",
         }
 
+    @staticmethod
+    def _format_deadline(raw: str) -> str:
+        """Convert ISO date string to a human-readable deadline."""
+        if not raw:
+            return "soon"
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt.strftime("%d %b %Y")  # e.g. "15 Dec 2026"
+        except (ValueError, TypeError):
+            return raw  # return as-is if already readable
+
+    @staticmethod
+    def _format_slot(slot) -> str:
+        """Extract a human-readable label from a slot (dict or string)."""
+        if isinstance(slot, dict):
+            return slot.get("label") or slot.get("iso", "soon")
+        return str(slot)
+
+    @staticmethod
+    def _format_delta(delta) -> str:
+        """Format delta percentage for display."""
+        try:
+            val = float(delta)
+            # Convert from decimal ratio (e.g., -0.50) to percentage
+            if -1 < val < 1 and val != 0:
+                return f"{abs(val * 100):.0f}"
+            return f"{abs(val):.0f}"
+        except (ValueError, TypeError):
+            return str(delta)
+
     def _fallback_compose(self, ctx: ResolvedContext) -> dict:
         """Deterministic data-driven fallback when LLM is unavailable."""
         merchant = ctx.merchant
@@ -153,81 +185,184 @@ class Dispatcher:
             
         elif kind == "perf_dip":
             metric = payload.get("metric", "performance")
-            delta = payload.get("delta_pct", "0")
+            delta = self._format_delta(payload.get("delta_pct", 0))
             body = f"Hi {m_name}, noticed your {metric} is down by {delta}% this week. Based on peer data in {category.get('slug')}, this looks like a seasonal shift. Should we skip ad spend this week to save budget?"
             
         elif kind == "perf_spike":
             metric = payload.get("metric", "views")
-            delta = payload.get("delta_pct", "0")
+            delta = self._format_delta(payload.get("delta_pct", 0))
             body = f"Hi {m_name}, Vera here! Your {metric} jumped {delta}% this week. This looks sustainable. Want to capitalize on this momentum with a targeted campaign?"
             cta = "binary_yes_stop"
             
         elif kind == "recall_due" and ctx.customer:
             c_name = ctx.customer.get("identity", {}).get("name", "there")
-            slots = payload.get("available_slots", ["tomorrow"])
-            slot_str = slots[0] if slots else "soon"
-            body = f"Hi {c_name}, {m_full_name} here! It's been a few months since your last visit. We have a slot available {slot_str}. Would you like to book?"
+            slots = payload.get("available_slots", [])
+            if slots:
+                slot_str = self._format_slot(slots[0])
+            else:
+                slot_str = "soon"
+            service = payload.get("service_due", "your check-up").replace("_", " ")
+            body = f"Hi {c_name}, {m_full_name} here! It's been a few months since your last visit. We have a slot available on {slot_str}. Would you like to book?"
             cta = "binary_yes_stop"
             send_as = "merchant_on_behalf"
             
         elif kind == "ipl_match_today":
-            match = payload.get("match", "the IPL match")
-            body = f"Hi {m_name}, {match} is tonight. Usually, this leads to a dip in dine-in covers. Want me to push a BOGO delivery offer for tonight instead?"
+            match_name = payload.get("match", "the IPL match")
+            body = f"Hi {m_name}, {match_name} is tonight. Usually, this leads to a dip in dine-in covers. Want me to push a BOGO delivery offer for tonight instead?"
             
         elif kind == "renewal_due":
-            days_left = payload.get("days_remaining", "0")
-            plan = merchant.get("subscription", {}).get("plan", "professional")
-            body = f"Hi {m_name}, your {plan} subscription expires in {days_left} days. Want me to walk you through the renewal process? Takes just 2 minutes."
+            days_left = payload.get("days_remaining", 0)
+            plan = payload.get("plan") or merchant.get("subscription", {}).get("plan", "professional")
+            amount = payload.get("renewal_amount")
+            amount_str = f" (₹{amount})" if amount else ""
+            body = f"Hi {m_name}, your {plan} subscription expires in {days_left} days{amount_str}. Want me to walk you through the renewal process? Takes just 2 minutes."
             cta = "binary_yes_stop"
             
         elif kind == "festival_upcoming":
-            festival = payload.get("festival_name", "the upcoming festival")
-            days_until = payload.get("days_until", "30")
-            body = f"Hi {m_name}, {festival} is coming up in {days_until} days. This is a big footfall window for {category.get('slug')}. Want me to draft a seasonal offer for you?"
+            festival = payload.get("festival") or payload.get("festival_name", "the upcoming festival")
+            days_until = payload.get("days_until", 30)
+            date_str = payload.get("date", "")
+            date_display = ""
+            if date_str:
+                date_display = f" ({self._format_deadline(date_str)})"
+            body = f"Hi {m_name}, {festival}{date_display} is coming up in {days_until} days. This is a big footfall window for {category.get('slug')}. Want me to draft a seasonal offer for you?"
             cta = "binary_yes_stop"
             
         elif kind == "regulation_change":
-            change = payload.get("summary", "a regulation update")
-            deadline = payload.get("deadline", "soon")
-            body = f"Hi {m_name}, Vera here. There's a compliance update relevant to your business. Deadline: {deadline}. Want me to break it down for you and suggest next steps?"
+            # Use deadline_iso (the actual field name in trigger data), fall back to deadline
+            deadline_raw = payload.get("deadline_iso") or payload.get("deadline", "")
+            deadline = self._format_deadline(deadline_raw)
+            # Try to get the digest item for more detail
+            item_id = payload.get("top_item_id")
+            item = next((i for i in category.get("digest", []) if i.get("id") == item_id), {})
+            change_title = item.get("title", payload.get("summary", "a regulation update"))
+            body = f"Hi {m_name}, Vera here. There's a compliance update relevant to your business: {change_title}. Deadline: {deadline}. Want me to break it down for you and suggest next steps?"
             
         elif kind == "milestone_reached":
-            milestone = payload.get("milestone", "100 reviews")
-            body = f"Hi {m_name}, congrats! You've hit {milestone}! 🎉 Want to celebrate this with a GBP post or customer thank-you campaign?"
+            metric = payload.get("metric", "reviews")
+            value_now = payload.get("value_now")
+            milestone_val = payload.get("milestone_value")
+            is_imminent = payload.get("is_imminent", False)
+            if is_imminent and value_now and milestone_val:
+                gap = milestone_val - value_now
+                body = f"Hi {m_name}, Vera here! You're just {gap} away from {milestone_val} {metric.replace('_', ' ')}! 🎉 Want to celebrate this milestone with a GBP post or customer thank-you campaign?"
+            else:
+                milestone = payload.get("milestone", f"{milestone_val} {metric.replace('_', ' ')}" if milestone_val else "a big milestone")
+                body = f"Hi {m_name}, congrats! You've hit {milestone}! 🎉 Want to celebrate this with a GBP post or customer thank-you campaign?"
             cta = "binary_yes_stop"
             
         elif kind == "competitor_opened":
             competitor = payload.get("competitor_name", "a new competitor")
             distance = payload.get("distance_km", "nearby")
-            body = f"Hi {m_name}, {competitor} just opened {distance}. Let's sharpen your differentiation. What's one thing you offer that they don't?"
+            their_offer = payload.get("their_offer", "")
+            distance_str = f"{distance} km away" if isinstance(distance, (int, float)) else distance
+            offer_str = f" They're offering {their_offer}." if their_offer else ""
+            body = f"Hi {m_name}, {competitor} just opened {distance_str}.{offer_str} Let's sharpen your differentiation. What's one thing you offer that they don't?"
             
         elif kind == "review_theme_emerged":
-            theme = payload.get("theme", "pricing")
-            count = payload.get("count", "5")
+            theme = payload.get("theme", "pricing").replace("_", " ")
+            count = payload.get("occurrences_30d") or payload.get("count", 5)
             sentiment = payload.get("sentiment", "mixed")
-            body = f"Hi {m_name}, I noticed customers are mentioning '{theme}' in reviews ({count} times, {sentiment}). Should we address this in a post or FAQ?"
+            quote = payload.get("common_quote", "")
+            quote_str = f" One customer said: '{quote}'." if quote else ""
+            body = f"Hi {m_name}, I noticed customers are mentioning '{theme}' in reviews ({count} times, {sentiment} sentiment).{quote_str} Should we address this in a post or FAQ?"
             
         elif kind == "customer_lapsed_soft" and ctx.customer:
             c_name = ctx.customer.get("identity", {}).get("name", "there")
-            body = f"Hi {c_name}, it's been a while! We'd love to see you again. Got a slot next week if you're interested."
+            body = f"Hi {c_name}, it's been a while! {m_full_name} would love to see you again. Got a slot next week if you're interested."
             cta = "binary_yes_stop"
             send_as = "merchant_on_behalf"
             
         elif kind == "customer_lapsed_hard" and ctx.customer:
             c_name = ctx.customer.get("identity", {}).get("name", "there")
-            body = f"Hi {c_name}, we miss you! Try us again this week — first visit is on us."
+            prev_focus = payload.get("previous_focus", "").replace("_", " ")
+            focus_str = f" We've got something new for your {prev_focus} goals." if prev_focus else ""
+            body = f"Hi {c_name}, we miss you at {m_full_name}!{focus_str} Try us again this week — first visit is on us."
             cta = "binary_yes_stop"
             send_as = "merchant_on_behalf"
             
         elif kind == "gbp_unverified":
-            uplift = payload.get("estimated_uplift_pct", "23")
+            uplift = payload.get("estimated_uplift_pct", 0.23)
+            # Convert from decimal to percentage if needed
+            if isinstance(uplift, float) and uplift < 1:
+                uplift = f"{uplift * 100:.0f}"
             body = f"Hi {m_name}, Vera here. Verified GBP gets ~{uplift}% more interactions. Let me start the verification for you (takes 5 mins). Want me to do that?"
             cta = "binary_yes_stop"
             
         elif kind == "supply_alert":
-            product = payload.get("product", "a product")
-            batch = payload.get("batch_id", "unknown")
-            body = f"Hi {m_name}, ALERT: {product} (batch {batch}) may have an issue. Let me draft a customer notification and replacement flow for you."
+            molecule = payload.get("molecule", "a product")
+            batches = payload.get("affected_batches", [])
+            manufacturer = payload.get("manufacturer", "unknown")
+            batch_str = ", ".join(batches[:3]) if batches else payload.get("batch_id", "unknown")
+            body = f"Hi {m_name}, ALERT: {molecule} (batches {batch_str}, manufacturer {manufacturer}) has a recall notice. Let me draft a customer notification and replacement flow for you."
+
+        elif kind == "chronic_refill_due" and ctx.customer:
+            c_name = ctx.customer.get("identity", {}).get("name", "there")
+            molecules = payload.get("molecule_list", [])
+            mol_str = ", ".join(molecules) if molecules else "your medications"
+            runout = self._format_deadline(payload.get("stock_runs_out_iso", ""))
+            delivery = " We can deliver to your saved address." if payload.get("delivery_address_saved") else ""
+            body = f"Hi {c_name}, {m_full_name} here. Your {mol_str} refill is due — stock runs out by {runout}.{delivery} Reply CONFIRM to dispatch."
+            cta = "binary_yes_stop"
+            send_as = "merchant_on_behalf"
+
+        elif kind == "trial_followup" and ctx.customer:
+            c_name = ctx.customer.get("identity", {}).get("name", "there")
+            trial_date = self._format_deadline(payload.get("trial_date", ""))
+            sessions = payload.get("next_session_options", [])
+            session_str = self._format_slot(sessions[0]) if sessions else "next week"
+            body = f"Hi {c_name}, {m_full_name} here! Hope you enjoyed your trial on {trial_date}. We have a spot on {session_str} — would you like to continue?"
+            cta = "binary_yes_stop"
+            send_as = "merchant_on_behalf"
+
+        elif kind == "wedding_package_followup" and ctx.customer:
+            c_name = ctx.customer.get("identity", {}).get("name", "there")
+            days_to = payload.get("days_to_wedding", "")
+            next_step = payload.get("next_step_window_open", "").replace("_", " ")
+            body = f"Hi {c_name}, {m_full_name} here! With your wedding {days_to} days away, now's the perfect time to start your {next_step}. Want to book a session?"
+            cta = "binary_yes_stop"
+            send_as = "merchant_on_behalf"
+
+        elif kind == "active_planning_intent":
+            topic = payload.get("intent_topic", "your idea").replace("_", " ")
+            body = f"Hi {m_name}, great! I've drafted a quick plan for the {topic}. Let me share it — you can tweak anything. Want me to send it over?"
+            cta = "binary_yes_stop"
+
+        elif kind == "dormant_with_vera":
+            days_since = payload.get("days_since_last_merchant_message", "a while")
+            last_topic = payload.get("last_topic", "").replace("_", " ")
+            topic_ref = f" Last time we spoke about {last_topic}." if last_topic else ""
+            body = f"Hi {m_name}, Vera here. It's been {days_since} days.{topic_ref} I've spotted a few new insights for {m_full_name}. Want a quick update?"
+
+        elif kind == "winback_eligible":
+            dip = self._format_delta(payload.get("perf_dip_pct", 0))
+            lapsed = payload.get("lapsed_customers_added_since_expiry", 0)
+            body = f"Hi {m_name}, Vera here. Since your subscription ended, your visibility dropped {dip}% and {lapsed} potential customers slipped by. Want to fix that with a quick reactivation?"
+            cta = "binary_yes_stop"
+
+        elif kind == "seasonal_perf_dip":
+            metric = payload.get("metric", "views")
+            delta = self._format_delta(payload.get("delta_pct", 0))
+            season = payload.get("season_note", "this season").replace("_", " ")
+            body = f"Hi {m_name}, your {metric} are down {delta}% — but this is typical for {season}. I'd suggest saving ad budget for the next high-conversion window. Focus on retaining your existing base for now."
+
+        elif kind == "category_seasonal":
+            trends = payload.get("trends", [])
+            trend_str = ", ".join(t.replace("_", " ") for t in trends[:3]) if trends else "seasonal shifts"
+            body = f"Hi {m_name}, Vera here. Summer demand data is in: {trend_str}. Want me to suggest shelf adjustments based on this?"
+
+        elif kind == "cde_opportunity":
+            item_id = payload.get("digest_item_id")
+            item = next((i for i in category.get("digest", []) if i.get("id") == item_id), {})
+            title = item.get("title", "an upcoming CDE event")
+            credits = payload.get("credits", "")
+            fee = payload.get("fee", "")
+            credit_str = f" ({credits} credits, {fee})" if credits else ""
+            body = f"Hi {m_name}, Vera here. Found a CDE opportunity: {title}{credit_str}. Interested?"
+
+        elif kind == "curious_ask_due":
+            template = payload.get("ask_template", "business_update").replace("_", " ")
+            body = f"Hi {m_name}, Vera here — quick question: {template}? I can turn your answer into a GBP post or WhatsApp update for your customers."
             
         else:
             # Generic fallback with context awareness

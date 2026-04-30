@@ -53,34 +53,72 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
 
+# Track LLM health — skip calls after repeated failures to avoid 25s timeouts
+_llm_consecutive_failures = 0
+_LLM_FAILURE_THRESHOLD = 3  # After this many consecutive failures, skip LLM
+_llm_last_success_time = 0.0
 
-async def llm_complete(system: str, user: str) -> str:
-    """Call the configured LLM provider."""
+
+def _make_llm_request(url: str, body: bytes, headers: dict, timeout: int = 15) -> dict:
+    """Make a single HTTP request to an LLM API with proper error handling."""
     import urllib.request
     import urllib.error
 
+    req = urllib.request.Request(url, data=body, headers=headers)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return json.loads(resp.read().decode("utf-8"))
+
+
+def _build_openai_compatible_request(
+    url: str, model: str, system: str, user: str, api_key: str
+) -> tuple[str, bytes, dict]:
+    """Build request for OpenAI-compatible APIs (OpenAI, DeepSeek, Groq)."""
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 1200,
+    }).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    return url, body, headers
+
+
+async def llm_complete(system: str, user: str) -> str:
+    """Call the configured LLM provider with retry and health tracking.
+
+    Raises Exception if all attempts fail (caller should catch and use fallback).
+    """
+    global _llm_consecutive_failures, _llm_last_success_time
+    import urllib.error
+
+    # Fast-fail: no API key configured
+    if not LLM_API_KEY:
+        raise RuntimeError("LLM_API_KEY not configured — using deterministic fallback")
+
+    # Fast-fail: LLM has been failing repeatedly, skip for a cooldown period
+    if _llm_consecutive_failures >= _LLM_FAILURE_THRESHOLD:
+        # Allow retry every 60 seconds
+        if time.time() - _llm_last_success_time < 60:
+            raise RuntimeError(
+                f"LLM circuit breaker open ({_llm_consecutive_failures} consecutive failures) "
+                f"— using deterministic fallback"
+            )
+        else:
+            logger.info("LLM circuit breaker: attempting recovery after cooldown")
+
+    # Build provider-specific request
     if LLM_PROVIDER == "openai":
         model = LLM_MODEL or "gpt-4o-mini"
-        body = json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 1200,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {LLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
+        url, body, headers = _build_openai_compatible_request(
+            "https://api.openai.com/v1/chat/completions", model, system, user, LLM_API_KEY
         )
-        resp = urllib.request.urlopen(req, timeout=25)
-        data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
+        extract = lambda data: data["choices"][0]["message"]["content"]
 
     elif LLM_PROVIDER == "anthropic":
         model = LLM_MODEL or "claude-3-5-sonnet-20241022"
@@ -90,18 +128,13 @@ async def llm_complete(system: str, user: str) -> str:
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=body,
-            headers={
-                "x-api-key": LLM_API_KEY,
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01",
-            },
-        )
-        resp = urllib.request.urlopen(req, timeout=25)
-        data = json.loads(resp.read().decode("utf-8"))
-        return data["content"][0]["text"]
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": LLM_API_KEY,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        extract = lambda data: data["content"][0]["text"]
 
     elif LLM_PROVIDER == "gemini":
         model = LLM_MODEL or "gemini-1.5-flash"
@@ -111,36 +144,84 @@ async def llm_complete(system: str, user: str) -> str:
             "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1200},
         }).encode("utf-8")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={LLM_API_KEY}"
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=25)
-        data = json.loads(resp.read().decode("utf-8"))
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        headers = {"Content-Type": "application/json"}
+        extract = lambda data: data["candidates"][0]["content"]["parts"][0]["text"]
 
     elif LLM_PROVIDER == "deepseek":
         model = LLM_MODEL or "deepseek-chat"
-        body = json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 1200,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.deepseek.com/v1/chat/completions",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {LLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
+        url, body, headers = _build_openai_compatible_request(
+            "https://api.deepseek.com/v1/chat/completions", model, system, user, LLM_API_KEY
         )
-        resp = urllib.request.urlopen(req, timeout=25)
-        data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
+        extract = lambda data: data["choices"][0]["message"]["content"]
+
+    elif LLM_PROVIDER == "groq":
+        model = LLM_MODEL or "llama-3.1-70b-versatile"
+        url, body, headers = _build_openai_compatible_request(
+            "https://api.groq.com/openai/v1/chat/completions", model, system, user, LLM_API_KEY
+        )
+        extract = lambda data: data["choices"][0]["message"]["content"]
 
     else:
         raise ValueError(f"Unknown LLM provider: {LLM_PROVIDER}")
+
+    # Retry with backoff (2 attempts: 0s, then 1s delay)
+    last_error = None
+    for attempt in range(2):
+        try:
+            if attempt > 0:
+                import asyncio
+                await asyncio.sleep(1.0)  # Brief backoff before retry
+                logger.info(f"LLM retry attempt {attempt + 1}")
+
+            data = _make_llm_request(url, body, headers, timeout=15)
+            result = extract(data)
+
+            # Success — reset failure counter
+            _llm_consecutive_failures = 0
+            _llm_last_success_time = time.time()
+            return result
+
+        except urllib.error.HTTPError as e:
+            last_error = e
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8")[:200]
+            except Exception:
+                pass
+
+            if e.code == 401:
+                # Auth failure — no point retrying
+                _llm_consecutive_failures += 1
+                raise RuntimeError(f"LLM auth failed (401): check LLM_API_KEY. {error_body}")
+            elif e.code == 429:
+                # Rate limited — retry with longer backoff
+                logger.warning(f"LLM rate limited (429), attempt {attempt + 1}")
+                if attempt == 0:
+                    import asyncio
+                    await asyncio.sleep(2.0)
+                continue
+            elif e.code >= 500:
+                # Server error — retry
+                logger.warning(f"LLM server error ({e.code}), attempt {attempt + 1}")
+                continue
+            else:
+                _llm_consecutive_failures += 1
+                raise RuntimeError(f"LLM HTTP error ({e.code}): {error_body}")
+
+        except (TimeoutError, OSError) as e:
+            last_error = e
+            logger.warning(f"LLM network error on attempt {attempt + 1}: {type(e).__name__}: {e}")
+            continue
+
+        except Exception as e:
+            last_error = e
+            logger.warning(f"LLM unexpected error on attempt {attempt + 1}: {type(e).__name__}: {e}")
+            continue
+
+    # All attempts failed
+    _llm_consecutive_failures += 1
+    raise RuntimeError(f"LLM failed after 2 attempts: {last_error}")
+
 
 
 # ─── Dispatcher + Reply Handler ───────────────────────────────────
@@ -191,10 +272,10 @@ async def metadata():
     return {
         "team_name": "Vera Prime",
         "team_members": ["Rithvik"],
-        "model": LLM_MODEL or f"{LLM_PROVIDER}-default",
-        "approach": "4-context composer with per-trigger-kind prompt routing, post-validation, and multi-turn reply handling",
+        "model": LLM_MODEL or {"openai": "gpt-4o-mini", "anthropic": "claude-3-5-sonnet-20241022", "gemini": "gemini-1.5-flash", "deepseek": "deepseek-chat", "groq": "llama-3.1-70b-versatile"}.get(LLM_PROVIDER, f"{LLM_PROVIDER}-default"),
+        "approach": "4-context composer with per-trigger-kind prompt routing, deterministic fallback, post-validation, and multi-turn reply handling",
         "contact_email": "rithvik@example.com",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "submitted_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -279,12 +360,25 @@ async def reply(body: ReplyBody):
         return result
     except Exception as e:
         logger.error(f"Reply handler error: {e}", exc_info=True)
-        return {
-            "action": "send",
-            "body": "Got it — let me check on that and get back to you.",
-            "cta": "open_ended",
-            "rationale": "Error recovery fallback",
-        }
+        # Context-aware error fallback
+        if body.from_role == "customer" and body.customer_id:
+            customer = store.get_customer(body.customer_id)
+            c_name = customer.get("identity", {}).get("name", "there") if customer else "there"
+            return {
+                "action": "send",
+                "body": f"Got it, {c_name}! Let me check on that and get back to you shortly.",
+                "cta": "open_ended",
+                "rationale": "Error recovery fallback — addressing customer",
+            }
+        else:
+            merchant = store.get_merchant(body.merchant_id) if body.merchant_id else None
+            m_name = merchant.get("identity", {}).get("owner_first_name", "there") if merchant else "there"
+            return {
+                "action": "send",
+                "body": f"Got it, {m_name} — let me check on that and get back to you.",
+                "cta": "open_ended",
+                "rationale": "Error recovery fallback — addressing merchant",
+            }
 
 
 # ─── Main ─────────────────────────────────────────────────────────
@@ -292,7 +386,11 @@ async def reply(body: ReplyBody):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
-    logger.info(f"Starting Vera Bot on port {port} with {LLM_PROVIDER}")
-    if not LLM_API_KEY:
-        logger.warning("LLM_API_KEY not set — bot will use fallback compositions")
+    model_name = LLM_MODEL or {"openai": "gpt-4o-mini", "anthropic": "claude-3-5-sonnet-20241022", "gemini": "gemini-1.5-flash", "deepseek": "deepseek-chat", "groq": "llama-3.1-70b-versatile"}.get(LLM_PROVIDER, "unknown")
+    logger.info(f"Starting Vera Bot on port {port}")
+    logger.info(f"LLM provider: {LLM_PROVIDER} / model: {model_name}")
+    if LLM_API_KEY:
+        logger.info(f"LLM_API_KEY configured ({len(LLM_API_KEY)} chars) — LLM composition enabled")
+    else:
+        logger.warning("LLM_API_KEY not set — bot will use deterministic fallback compositions (still functional)")
     uvicorn.run(app, host="0.0.0.0", port=port)
